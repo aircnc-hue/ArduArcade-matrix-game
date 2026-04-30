@@ -1,0 +1,200 @@
+#include <Arduino.h>
+#include <MD_MAX72xx.h>
+#include <SPI.h>
+
+namespace Config {
+constexpr uint8_t MAX_DEVICES = 8;
+constexpr uint8_t DATA_PIN = 11;
+constexpr uint8_t CLK_PIN = 13;
+constexpr uint8_t CS_PIN = 10;
+
+constexpr uint8_t JOY_X_PIN = A0;
+constexpr uint8_t JOY_Y_PIN = A1;
+constexpr uint8_t JOY_BUTTON_PIN = 2;
+
+constexpr uint8_t DISPLAY_WIDTH = MAX_DEVICES * 8;
+constexpr uint8_t DISPLAY_HEIGHT = 8;
+
+constexpr int ANALOG_CENTER = 512;
+constexpr int ANALOG_DEADZONE = 90;
+constexpr uint8_t INDICATOR_SPAN = 5;
+constexpr uint8_t BRIGHTNESS = 2;
+constexpr uint16_t FRAME_DELAY_MS = 35;
+}  // namespace Config
+
+// Most 8x32/8x64 MAX7219 modules sold for Arduino use FC16 wiring.
+// If the image looks scrambled, try PAROLA_HW or GENERIC_HW instead.
+MD_MAX72XX mx = MD_MAX72XX(MD_MAX72XX::FC16_HW, Config::CS_PIN,
+                           Config::MAX_DEVICES);
+
+struct JoystickState {
+  int rawX = Config::ANALOG_CENTER;
+  int rawY = Config::ANALOG_CENTER;
+  int posX = Config::DISPLAY_WIDTH / 2;
+  int posY = Config::DISPLAY_HEIGHT / 2;
+  bool pressed = false;
+};
+
+JoystickState joystick;
+uint32_t lastFrameAt = 0;
+bool pulseOn = false;
+
+uint8_t clampToByte(int value, int low, int high) {
+  if (value < low) {
+    value = low;
+  }
+  if (value > high) {
+    value = high;
+  }
+  return static_cast<uint8_t>(value);
+}
+
+uint8_t mapAxisToDisplay(int rawValue, uint8_t maxValue) {
+  const int centered = rawValue - Config::ANALOG_CENTER;
+  if (abs(centered) <= Config::ANALOG_DEADZONE) {
+    return maxValue / 2;
+  }
+
+  const int constrained = constrain(rawValue, 0, 1023);
+  return static_cast<uint8_t>(map(constrained, 0, 1023, 0, maxValue));
+}
+
+void setPixelSafe(int x, int y, bool state) {
+  if (x < 0 || x >= Config::DISPLAY_WIDTH || y < 0 ||
+      y >= Config::DISPLAY_HEIGHT) {
+    return;
+  }
+  mx.setPoint(static_cast<uint8_t>(y), static_cast<uint8_t>(x), state);
+}
+
+void drawHorizontalIndicator(uint8_t centerX, uint8_t row) {
+  const int start = centerX - (Config::INDICATOR_SPAN / 2);
+  for (uint8_t i = 0; i < Config::INDICATOR_SPAN; ++i) {
+    setPixelSafe(start + i, row, true);
+  }
+}
+
+void drawVerticalIndicator(uint8_t centerX) {
+  for (uint8_t y = 1; y < Config::DISPLAY_HEIGHT - 1; ++y) {
+    setPixelSafe(centerX, y, pulseOn);
+  }
+}
+
+void runStartupSequence() {
+  mx.clear();
+
+  for (uint8_t x = 0; x < Config::DISPLAY_WIDTH; ++x) {
+    for (uint8_t y = 0; y < Config::DISPLAY_HEIGHT; ++y) {
+      mx.setPoint(y, x, true);
+    }
+    delay(20);
+  }
+
+  for (uint8_t y = 0; y < Config::DISPLAY_HEIGHT; ++y) {
+    mx.clear();
+    for (uint8_t x = 0; x < Config::DISPLAY_WIDTH; ++x) {
+      mx.setPoint(y, x, true);
+    }
+    delay(70);
+  }
+
+  mx.clear();
+  for (uint8_t x = 0; x < Config::DISPLAY_WIDTH; ++x) {
+    for (uint8_t y = 0; y < Config::DISPLAY_HEIGHT; ++y) {
+      const bool checker = ((x + y) % 2) == 0;
+      mx.setPoint(y, x, checker);
+    }
+  }
+  delay(250);
+  mx.clear();
+}
+
+void readJoystick() {
+  joystick.rawX = analogRead(Config::JOY_X_PIN);
+  joystick.rawY = analogRead(Config::JOY_Y_PIN);
+  joystick.pressed = digitalRead(Config::JOY_BUTTON_PIN) == LOW;
+
+  joystick.posX = mapAxisToDisplay(joystick.rawX, Config::DISPLAY_WIDTH - 1);
+  joystick.posY =
+      mapAxisToDisplay(1023 - joystick.rawY, Config::DISPLAY_HEIGHT - 1);
+}
+
+void renderTestPattern() {
+  mx.clear();
+
+  // Top bar follows X.
+  drawHorizontalIndicator(static_cast<uint8_t>(joystick.posX), 0);
+
+  // Bottom bar follows Y using X position to show row movement.
+  setPixelSafe(0, joystick.posY, true);
+  setPixelSafe(Config::DISPLAY_WIDTH - 1, joystick.posY, true);
+  for (uint8_t x = 0; x < 6; ++x) {
+    setPixelSafe(x, joystick.posY, true);
+  }
+
+  // Main cursor.
+  setPixelSafe(joystick.posX, joystick.posY, true);
+  setPixelSafe(joystick.posX - 1, joystick.posY, true);
+  setPixelSafe(joystick.posX + 1, joystick.posY, true);
+  setPixelSafe(joystick.posX, joystick.posY - 1, true);
+  setPixelSafe(joystick.posX, joystick.posY + 1, true);
+
+  // Button test: vertical pulse in the center when pressed.
+  if (joystick.pressed) {
+    drawVerticalIndicator(Config::DISPLAY_WIDTH / 2);
+    setPixelSafe((Config::DISPLAY_WIDTH / 2) - 1, 3, true);
+    setPixelSafe((Config::DISPLAY_WIDTH / 2) + 1, 3, true);
+    setPixelSafe((Config::DISPLAY_WIDTH / 2) - 1, 4, true);
+    setPixelSafe((Config::DISPLAY_WIDTH / 2) + 1, 4, true);
+  }
+
+  // Small frame dots so orientation problems are obvious.
+  setPixelSafe(0, 0, true);
+  setPixelSafe(Config::DISPLAY_WIDTH - 1, 0, true);
+  setPixelSafe(0, Config::DISPLAY_HEIGHT - 1, true);
+  setPixelSafe(Config::DISPLAY_WIDTH - 1, Config::DISPLAY_HEIGHT - 1, true);
+}
+
+void printTelemetry() {
+  static uint32_t lastPrintedAt = 0;
+  const uint32_t now = millis();
+  if (now - lastPrintedAt < 150) {
+    return;
+  }
+  lastPrintedAt = now;
+
+  Serial.print(F("X="));
+  Serial.print(joystick.rawX);
+  Serial.print(F(" Y="));
+  Serial.print(joystick.rawY);
+  Serial.print(F(" PX="));
+  Serial.print(joystick.posX);
+  Serial.print(F(" PY="));
+  Serial.print(joystick.posY);
+  Serial.print(F(" BTN="));
+  Serial.println(joystick.pressed ? F("ON") : F("OFF"));
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(Config::JOY_BUTTON_PIN, INPUT_PULLUP);
+
+  mx.begin();
+  mx.control(MD_MAX72XX::INTENSITY, Config::BRIGHTNESS);
+  mx.clear();
+
+  runStartupSequence();
+}
+
+void loop() {
+  const uint32_t now = millis();
+  if (now - lastFrameAt < Config::FRAME_DELAY_MS) {
+    return;
+  }
+  lastFrameAt = now;
+
+  pulseOn = !pulseOn;
+  readJoystick();
+  renderTestPattern();
+  printTelemetry();
+}

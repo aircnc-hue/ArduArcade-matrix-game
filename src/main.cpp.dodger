@@ -1,0 +1,469 @@
+#include <Arduino.h>
+#include <MD_MAX72xx.h>
+#include <SPI.h>
+
+namespace Config {
+constexpr uint8_t MAX_DEVICES = 8;
+constexpr uint8_t CS_PIN = 10;
+
+constexpr uint8_t JOY_X_PIN = A0;
+constexpr uint8_t JOY_Y_PIN = A1;
+constexpr uint8_t JOY_BUTTON_PIN = 2;
+
+constexpr uint8_t DISPLAY_WIDTH = MAX_DEVICES * 8;
+constexpr uint8_t DISPLAY_HEIGHT = 8;
+
+constexpr uint8_t ARENA_X0 = 0;
+constexpr uint8_t ARENA_WIDTH = 40;
+constexpr uint8_t ARENA_X1 = ARENA_X0 + ARENA_WIDTH - 1;
+
+constexpr int ANALOG_CENTER = 512;
+constexpr int ANALOG_DEADZONE = 130;
+
+constexpr uint8_t BRIGHTNESS = 1;
+constexpr uint8_t MAX_OBSTACLES = 12;
+constexpr uint8_t START_LIVES = 3;
+constexpr uint8_t MAX_LIVES = 5;
+constexpr uint16_t EXTRA_LIFE_EVERY = 120;
+
+constexpr uint16_t INPUT_COOLDOWN_MS = 60;
+constexpr uint16_t DASH_COOLDOWN_MS = 900;
+constexpr uint8_t DASH_PIXELS = 2;
+constexpr uint16_t OBSTACLE_STEP_START_MS = 116;
+constexpr uint16_t OBSTACLE_STEP_MIN_MS = 58;
+constexpr uint16_t SPAWN_START_MS = 520;
+constexpr uint16_t SPAWN_MIN_MS = 220;
+constexpr uint16_t SCORE_TICK_MS = 260;
+constexpr uint16_t RENDER_DELAY_MS = 30;
+
+constexpr uint16_t GAME_OVER_PREVIEW_MS = 3000;
+constexpr uint16_t BLINK_MS = 170;
+}  // namespace Config
+
+MD_MAX72XX mx =
+    MD_MAX72XX(MD_MAX72XX::FC16_HW, Config::CS_PIN, Config::MAX_DEVICES);
+
+struct Obstacle {
+  int8_t x;
+  int8_t y;
+  int8_t driftY;
+  uint8_t type;
+  uint8_t phase;
+  bool active;
+};
+
+Obstacle obstacles[Config::MAX_OBSTACLES];
+
+int8_t playerX = 6;
+int8_t playerY = Config::DISPLAY_HEIGHT / 2;
+
+uint16_t score = 0;
+uint8_t lives = Config::START_LIVES;
+uint16_t nextExtraLifeScore = Config::EXTRA_LIFE_EVERY;
+bool isGameOver = false;
+bool buttonLatch = false;
+bool obstacleStepPhase = false;
+
+uint32_t gameOverStartedAt = 0;
+uint32_t lastInputAt = 0;
+uint32_t lastDashAt = 0;
+uint32_t lastObstacleStepAt = 0;
+uint32_t lastSpawnAt = 0;
+uint32_t lastScoreAt = 0;
+uint32_t lastRenderAt = 0;
+
+const uint8_t DIGITS_3X5[10][3] = {
+    {0b11111, 0b10001, 0b11111},
+    {0b00000, 0b11111, 0b00000},
+    {0b11101, 0b10101, 0b10111},
+    {0b10101, 0b10101, 0b11111},
+    {0b00111, 0b00100, 0b11111},
+    {0b10111, 0b10101, 0b11101},
+    {0b11111, 0b10101, 0b11101},
+    {0b00001, 0b00001, 0b11111},
+    {0b11111, 0b10101, 0b11111},
+    {0b10111, 0b10101, 0b11111},
+};
+
+  void triggerGameOver();
+
+void clearObstacles() {
+  for (uint8_t i = 0; i < Config::MAX_OBSTACLES; ++i) {
+    obstacles[i].active = false;
+  }
+}
+
+void resetGame() {
+  playerX = 6;
+  playerY = Config::DISPLAY_HEIGHT / 2;
+
+  score = 0;
+  lives = Config::START_LIVES;
+  nextExtraLifeScore = Config::EXTRA_LIFE_EVERY;
+  isGameOver = false;
+  buttonLatch = false;
+  obstacleStepPhase = false;
+  gameOverStartedAt = 0;
+
+  clearObstacles();
+
+  const uint32_t now = millis();
+  lastInputAt = now;
+  lastDashAt = now;
+  lastObstacleStepAt = now;
+  lastSpawnAt = now;
+  lastScoreAt = now;
+  lastRenderAt = 0;
+}
+
+void onPlayerHit() {
+  if (lives > 1) {
+    lives--;
+    playerX = 6;
+    playerY = Config::DISPLAY_HEIGHT / 2;
+    clearObstacles();
+    lastSpawnAt = millis();
+    return;
+  }
+  lives = 0;
+  triggerGameOver();
+}
+
+void triggerGameOver() {
+  if (isGameOver) {
+    return;
+  }
+  isGameOver = true;
+  gameOverStartedAt = millis();
+}
+
+uint16_t obstacleStepMs() {
+  const uint16_t ramp = score / 16;
+  uint16_t step = Config::OBSTACLE_STEP_START_MS;
+  if (ramp * 3 >= step) {
+    step = Config::OBSTACLE_STEP_MIN_MS;
+  } else {
+    step -= (ramp * 3);
+    if (step < Config::OBSTACLE_STEP_MIN_MS) {
+      step = Config::OBSTACLE_STEP_MIN_MS;
+    }
+  }
+
+  // Small rhythm wave to avoid totally constant speed.
+  const uint8_t phase = static_cast<uint8_t>((millis() / 240) % 8);
+  const uint8_t wave = (phase < 4) ? phase : (7 - phase);  // 0..3..0
+  step += static_cast<uint16_t>(wave * 2);
+  return step;
+}
+
+uint16_t spawnMs() {
+  const uint16_t ramp = score / 14;
+  uint16_t interval = Config::SPAWN_START_MS;
+  if (ramp * 5 >= interval) {
+    interval = Config::SPAWN_MIN_MS;
+  } else {
+    interval -= (ramp * 5);
+    if (interval < Config::SPAWN_MIN_MS) {
+      interval = Config::SPAWN_MIN_MS;
+    }
+  }
+  return interval;
+}
+
+void spawnObstacle() {
+  uint8_t activeCount = 0;
+  for (uint8_t i = 0; i < Config::MAX_OBSTACLES; ++i) {
+    if (obstacles[i].active) {
+      activeCount++;
+    }
+  }
+
+  // Keep on-screen density low for better playability.
+  if (activeCount >= 6) {
+    return;
+  }
+
+  for (uint8_t i = 0; i < Config::MAX_OBSTACLES; ++i) {
+    if (!obstacles[i].active) {
+      obstacles[i].active = true;
+      obstacles[i].x = Config::ARENA_X1;
+      obstacles[i].y = static_cast<int8_t>(random(Config::DISPLAY_HEIGHT));
+
+      const uint8_t roll = static_cast<uint8_t>(random(100));
+      if (roll < 58) {
+        obstacles[i].type = 0;  // normal
+      } else if (roll < 83) {
+        obstacles[i].type = 1;  // slow
+      } else {
+        obstacles[i].type = 2;  // zigzag
+      }
+
+      obstacles[i].phase = 0;
+      if (obstacles[i].type == 1) {
+        obstacles[i].driftY = 0;
+      } else {
+        obstacles[i].driftY = static_cast<int8_t>(random(-1, 2));
+      }
+      return;
+    }
+  }
+}
+
+void readPlayerInput() {
+  const uint32_t now = millis();
+  if (now - lastInputAt < Config::INPUT_COOLDOWN_MS) {
+    return;
+  }
+
+  const int rawX = analogRead(Config::JOY_X_PIN);
+  const int rawY = analogRead(Config::JOY_Y_PIN);
+  const bool buttonPressed = digitalRead(Config::JOY_BUTTON_PIN) == LOW;
+
+  bool moved = false;
+
+  if (rawX > (Config::ANALOG_CENTER + Config::ANALOG_DEADZONE)) {
+    playerX++;
+    moved = true;
+  } else if (rawX < (Config::ANALOG_CENTER - Config::ANALOG_DEADZONE)) {
+    playerX--;
+    moved = true;
+  }
+
+  if (rawY > (Config::ANALOG_CENTER + Config::ANALOG_DEADZONE)) {
+    playerY--;
+    moved = true;
+  } else if (rawY < (Config::ANALOG_CENTER - Config::ANALOG_DEADZONE)) {
+    playerY++;
+    moved = true;
+  }
+
+  if (playerX < Config::ARENA_X0) {
+    playerX = Config::ARENA_X0;
+  }
+  if (playerX > Config::ARENA_X1) {
+    playerX = Config::ARENA_X1;
+  }
+  if (playerY < 0) {
+    playerY = 0;
+  }
+  if (playerY > (Config::DISPLAY_HEIGHT - 1)) {
+    playerY = Config::DISPLAY_HEIGHT - 1;
+  }
+
+  if (moved) {
+    lastInputAt = now;
+  }
+
+  if (buttonPressed && !buttonLatch && (now - lastDashAt >= Config::DASH_COOLDOWN_MS)) {
+    playerX += Config::DASH_PIXELS;
+    if (playerX > Config::ARENA_X1) {
+      playerX = Config::ARENA_X1;
+    }
+    lastDashAt = now;
+  }
+  buttonLatch = buttonPressed;
+}
+
+void updateObstacles() {
+  const uint32_t now = millis();
+  if (now - lastObstacleStepAt < obstacleStepMs()) {
+    return;
+  }
+  lastObstacleStepAt = now;
+  obstacleStepPhase = !obstacleStepPhase;
+
+  for (uint8_t i = 0; i < Config::MAX_OBSTACLES; ++i) {
+    if (!obstacles[i].active) {
+      continue;
+    }
+
+    bool moveLeft = true;
+    if (obstacles[i].type == 1) {
+      moveLeft = obstacleStepPhase;
+    }
+    if (moveLeft) {
+      obstacles[i].x--;
+    }
+
+    // Vertical drift changes occasionally.
+    if (obstacles[i].type != 1 && random(100) < 20) {
+      obstacles[i].driftY = static_cast<int8_t>(random(-1, 2));
+    }
+
+    if (obstacles[i].type == 2) {
+      obstacles[i].phase++;
+      if ((obstacles[i].phase % 3) == 0) {
+        obstacles[i].driftY = -obstacles[i].driftY;
+        if (obstacles[i].driftY == 0) {
+          obstacles[i].driftY = 1;
+        }
+      }
+    }
+
+    obstacles[i].y += obstacles[i].driftY;
+    if (obstacles[i].y < 0) {
+      obstacles[i].y = 0;
+      obstacles[i].driftY = 1;
+    }
+    if (obstacles[i].y >= Config::DISPLAY_HEIGHT) {
+      obstacles[i].y = Config::DISPLAY_HEIGHT - 1;
+      obstacles[i].driftY = -1;
+    }
+
+    if (obstacles[i].x < Config::ARENA_X0) {
+      obstacles[i].active = false;
+      score += 2;
+      continue;
+    }
+
+    if (obstacles[i].x == playerX && obstacles[i].y == playerY) {
+      onPlayerHit();
+      return;
+    }
+  }
+}
+
+void updateGame() {
+  if (isGameOver) {
+    if (millis() - gameOverStartedAt >= Config::GAME_OVER_PREVIEW_MS) {
+      resetGame();
+    }
+    return;
+  }
+
+  readPlayerInput();
+
+  const uint32_t now = millis();
+  if (now - lastSpawnAt >= spawnMs()) {
+    lastSpawnAt = now;
+    spawnObstacle();
+
+    // Rare extra spawn.
+    if (random(100) < 3) {
+      spawnObstacle();
+    }
+  }
+
+  updateObstacles();
+
+  if (now - lastScoreAt >= Config::SCORE_TICK_MS) {
+    lastScoreAt = now;
+    score++;
+
+    if (score >= nextExtraLifeScore && lives < Config::MAX_LIVES) {
+      lives++;
+      nextExtraLifeScore += Config::EXTRA_LIFE_EVERY;
+    }
+  }
+}
+
+void drawDigit3x5(uint8_t digit, uint8_t startX, uint8_t startY) {
+  if (digit > 9) {
+    return;
+  }
+  for (uint8_t col = 0; col < 3; ++col) {
+    const uint8_t bits = DIGITS_3X5[digit][col];
+    for (uint8_t row = 0; row < 5; ++row) {
+      if ((bits >> row) & 0x01) {
+        mx.setPoint(startY + row, startX + col, true);
+      }
+    }
+  }
+}
+
+void drawScorePanel() {
+  const bool show = !isGameOver || ((millis() / Config::BLINK_MS) % 2 == 0);
+  if (!show) {
+    return;
+  }
+
+  const uint8_t shown = static_cast<uint8_t>(score % 100);
+  const uint8_t tens = shown / 10;
+  const uint8_t ones = shown % 10;
+
+  // Score area starts around x=42 (outside the 40x8 arena).
+  drawDigit3x5(tens, 42, 1);
+  drawDigit3x5(ones, 46, 1);
+
+  // Small level bar by difficulty.
+  const uint8_t lvl = static_cast<uint8_t>((score / 40) % 8);
+  for (uint8_t i = 0; i < lvl; ++i) {
+    mx.setPoint(7 - i, 52, true);
+  }
+
+  // Lives indicator.
+  for (uint8_t i = 0; i < lives && i < Config::MAX_LIVES; ++i) {
+    mx.setPoint(7, static_cast<uint8_t>(54 + i), true);
+  }
+}
+
+void render() {
+  const uint32_t now = millis();
+  if (now - lastRenderAt < Config::RENDER_DELAY_MS) {
+    return;
+  }
+  lastRenderAt = now;
+
+  mx.clear();
+
+  // Arena guides.
+  for (uint8_t x = Config::ARENA_X0; x <= Config::ARENA_X1; x += 2) {
+    mx.setPoint(0, x, true);
+    mx.setPoint(Config::DISPLAY_HEIGHT - 1, x, true);
+  }
+
+  // Player pixel + one tail pixel for readability.
+  mx.setPoint(static_cast<uint8_t>(playerY), static_cast<uint8_t>(playerX), true);
+  if (playerX > Config::ARENA_X0) {
+    mx.setPoint(static_cast<uint8_t>(playerY), static_cast<uint8_t>(playerX - 1), true);
+  }
+
+  for (uint8_t i = 0; i < Config::MAX_OBSTACLES; ++i) {
+    if (obstacles[i].active) {
+      const uint8_t ox = static_cast<uint8_t>(obstacles[i].x);
+      const uint8_t oy = static_cast<uint8_t>(obstacles[i].y);
+      mx.setPoint(oy, ox, true);
+
+      if (obstacles[i].type == 1 && ox > Config::ARENA_X0) {
+        mx.setPoint(oy, static_cast<uint8_t>(ox - 1), true);
+      }
+
+      if (obstacles[i].type == 2) {
+        if (oy > 0) {
+          mx.setPoint(static_cast<uint8_t>(oy - 1), ox, true);
+        }
+        if (oy < Config::DISPLAY_HEIGHT - 1) {
+          mx.setPoint(static_cast<uint8_t>(oy + 1), ox, true);
+        }
+      }
+    }
+  }
+
+  if (isGameOver) {
+    for (uint8_t x = Config::ARENA_X0; x <= Config::ARENA_X1; ++x) {
+      if (((x + (now / 120)) % 2) == 0) {
+        mx.setPoint(0, x, true);
+        mx.setPoint(Config::DISPLAY_HEIGHT - 1, x, true);
+      }
+    }
+  }
+
+  drawScorePanel();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(Config::JOY_BUTTON_PIN, INPUT_PULLUP);
+
+  mx.begin();
+  mx.control(MD_MAX72XX::INTENSITY, Config::BRIGHTNESS);
+  mx.clear();
+
+  randomSeed(analogRead(Config::JOY_X_PIN) ^ analogRead(Config::JOY_Y_PIN));
+  resetGame();
+}
+
+void loop() {
+  updateGame();
+  render();
+}

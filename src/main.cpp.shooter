@@ -1,0 +1,415 @@
+#include <Arduino.h>
+#include <MD_MAX72xx.h>
+#include <SPI.h>
+
+namespace Config {
+constexpr uint8_t MAX_DEVICES = 8;
+constexpr uint8_t DATA_PIN = 11;
+constexpr uint8_t CLK_PIN = 13;
+constexpr uint8_t CS_PIN = 10;
+
+constexpr uint8_t JOY_X_PIN = A0;
+constexpr uint8_t JOY_Y_PIN = A1;
+constexpr uint8_t JOY_BUTTON_PIN = 2;
+
+constexpr uint8_t DISPLAY_WIDTH = MAX_DEVICES * 8;
+constexpr uint8_t DISPLAY_HEIGHT = 8;
+constexpr uint8_t SCORE_ZONE_WIDTH = 8;
+constexpr uint8_t GAME_WIDTH = DISPLAY_WIDTH - SCORE_ZONE_WIDTH;
+constexpr uint8_t SCORE_ZONE_X_START = GAME_WIDTH;
+
+constexpr int ANALOG_CENTER = 512;
+constexpr int ANALOG_DEADZONE = 140;
+constexpr uint8_t BRIGHTNESS = 1;
+
+constexpr uint8_t PLAYER_START_X = 2;
+constexpr uint8_t PLAYER_START_Y = DISPLAY_HEIGHT / 2;
+constexpr uint8_t PLAYER_MAX_X = 12;
+
+constexpr uint8_t MAX_BULLETS = 8;
+constexpr uint8_t MAX_ENEMIES = 12;
+
+constexpr uint16_t PLAYER_MOVE_COOLDOWN_MS = 80;
+constexpr uint16_t FIRE_COOLDOWN_MS = 150;
+constexpr uint16_t BULLET_STEP_MS = 70;
+constexpr uint16_t ENEMY_STEP_START_MS = 220;
+constexpr uint16_t ENEMY_STEP_MIN_MS = 90;
+constexpr uint16_t ENEMY_SPAWN_START_MS = 480;
+constexpr uint16_t ENEMY_SPAWN_MIN_MS = 170;
+constexpr uint16_t RENDER_DELAY_MS = 30;
+constexpr uint16_t SCORE_PRINT_MS = 1000;
+constexpr uint16_t SCORE_BLINK_MS = 180;
+constexpr uint16_t GAME_OVER_PREVIEW_MS = 3000;
+}  // namespace Config
+
+// Most 8x32/8x64 MAX7219 modules sold for Arduino use FC16 wiring.
+// If the image looks scrambled, try PAROLA_HW or GENERIC_HW instead.
+MD_MAX72XX mx = MD_MAX72XX(MD_MAX72XX::FC16_HW, Config::CS_PIN,
+                           Config::MAX_DEVICES);
+
+struct Point {
+  int8_t x;
+  int8_t y;
+};
+
+struct Entity {
+  int8_t x;
+  int8_t y;
+  bool active;
+};
+
+Point player = {Config::PLAYER_START_X, Config::PLAYER_START_Y};
+Entity bullets[Config::MAX_BULLETS];
+Entity enemies[Config::MAX_ENEMIES];
+
+uint16_t score = 0;
+bool isGameOver = false;
+bool restartButtonLatch = false;
+uint32_t gameOverStartedAt = 0;
+
+uint32_t lastPlayerMoveAt = 0;
+uint32_t lastFireAt = 0;
+uint32_t lastBulletStepAt = 0;
+uint32_t lastEnemyStepAt = 0;
+uint32_t lastEnemySpawnAt = 0;
+uint32_t lastRenderAt = 0;
+uint32_t lastScorePrintAt = 0;
+
+// 3x5 numeric glyphs packed by columns (bit0 is top row).
+const uint8_t DIGITS_3X5[10][3] = {
+  {0b11111, 0b10001, 0b11111},  // 0
+  {0b00000, 0b11111, 0b00000},  // 1
+  {0b11101, 0b10101, 0b10111},  // 2
+  {0b10101, 0b10101, 0b11111},  // 3
+  {0b00111, 0b00100, 0b11111},  // 4
+  {0b10111, 0b10101, 0b11101},  // 5
+  {0b11111, 0b10101, 0b11101},  // 6
+  {0b00001, 0b00001, 0b11111},  // 7
+  {0b11111, 0b10101, 0b11111},  // 8
+  {0b10111, 0b10101, 0b11111},  // 9
+};
+
+void clearEntities() {
+  for (uint8_t i = 0; i < Config::MAX_BULLETS; ++i) {
+    bullets[i].active = false;
+  }
+  for (uint8_t i = 0; i < Config::MAX_ENEMIES; ++i) {
+    enemies[i].active = false;
+  }
+}
+
+void resetGame() {
+  player.x = Config::PLAYER_START_X;
+  player.y = Config::PLAYER_START_Y;
+  score = 0;
+  isGameOver = false;
+  gameOverStartedAt = 0;
+  restartButtonLatch = false;
+  clearEntities();
+
+  const uint32_t now = millis();
+  lastPlayerMoveAt = now;
+  lastFireAt = now;
+  lastBulletStepAt = now;
+  lastEnemyStepAt = now;
+  lastEnemySpawnAt = now;
+  lastRenderAt = 0;
+  lastScorePrintAt = 0;
+}
+
+void triggerGameOver() {
+  if (isGameOver) {
+    return;
+  }
+  isGameOver = true;
+  gameOverStartedAt = millis();
+}
+
+uint16_t currentEnemyStepMs() {
+  const uint16_t speedBonus = static_cast<uint16_t>(constrain(score * 3, 0, 130));
+  uint16_t interval = Config::ENEMY_STEP_START_MS - speedBonus;
+  if (interval < Config::ENEMY_STEP_MIN_MS) {
+    interval = Config::ENEMY_STEP_MIN_MS;
+  }
+  return interval;
+}
+
+uint16_t currentEnemySpawnMs() {
+  const uint16_t spawnBonus = static_cast<uint16_t>(constrain(score * 4, 0, 300));
+  uint16_t interval = Config::ENEMY_SPAWN_START_MS - spawnBonus;
+  if (interval < Config::ENEMY_SPAWN_MIN_MS) {
+    interval = Config::ENEMY_SPAWN_MIN_MS;
+  }
+  return interval;
+}
+
+void spawnEnemy() {
+  for (uint8_t i = 0; i < Config::MAX_ENEMIES; ++i) {
+    if (!enemies[i].active) {
+      enemies[i].active = true;
+      enemies[i].x = Config::GAME_WIDTH - 1;
+      enemies[i].y = static_cast<int8_t>(random(Config::DISPLAY_HEIGHT));
+      return;
+    }
+  }
+}
+
+void fireBullet() {
+  for (uint8_t i = 0; i < Config::MAX_BULLETS; ++i) {
+    if (!bullets[i].active) {
+      bullets[i].active = true;
+      bullets[i].x = player.x + 1;
+      bullets[i].y = player.y;
+      return;
+    }
+  }
+}
+
+void readControls() {
+  const int rawX = analogRead(Config::JOY_X_PIN);
+  const int rawY = analogRead(Config::JOY_Y_PIN);
+  const bool firePressed = digitalRead(Config::JOY_BUTTON_PIN) == LOW;
+
+  const uint32_t now = millis();
+  if (!isGameOver && now - lastPlayerMoveAt >= Config::PLAYER_MOVE_COOLDOWN_MS) {
+    if (rawX > (Config::ANALOG_CENTER + Config::ANALOG_DEADZONE) &&
+        player.x < Config::PLAYER_MAX_X) {
+      player.x++;
+      lastPlayerMoveAt = now;
+    } else if (rawX < (Config::ANALOG_CENTER - Config::ANALOG_DEADZONE) &&
+               player.x > 0) {
+      player.x--;
+      lastPlayerMoveAt = now;
+    } else if (rawY > (Config::ANALOG_CENTER + Config::ANALOG_DEADZONE) &&
+               player.y > 0) {
+      player.y--;
+      lastPlayerMoveAt = now;
+    } else if (rawY < (Config::ANALOG_CENTER - Config::ANALOG_DEADZONE) &&
+               player.y < static_cast<int8_t>(Config::DISPLAY_HEIGHT - 1)) {
+      player.y++;
+      lastPlayerMoveAt = now;
+    }
+  }
+
+  if (!isGameOver && firePressed && (now - lastFireAt >= Config::FIRE_COOLDOWN_MS)) {
+    fireBullet();
+    lastFireAt = now;
+  }
+
+  restartButtonLatch = firePressed;
+}
+
+void moveBullets() {
+  for (uint8_t i = 0; i < Config::MAX_BULLETS; ++i) {
+    if (!bullets[i].active) {
+      continue;
+    }
+    bullets[i].x++;
+    if (bullets[i].x >= static_cast<int8_t>(Config::GAME_WIDTH)) {
+      bullets[i].active = false;
+    }
+  }
+}
+
+void moveEnemies() {
+  for (uint8_t i = 0; i < Config::MAX_ENEMIES; ++i) {
+    if (!enemies[i].active) {
+      continue;
+    }
+    enemies[i].x--;
+    if (enemies[i].x < 0) {
+      enemies[i].active = false;
+      triggerGameOver();
+      return;
+    }
+    if (enemies[i].x == player.x && enemies[i].y == player.y) {
+      triggerGameOver();
+      return;
+    }
+  }
+}
+
+void resolveHits() {
+  for (uint8_t bi = 0; bi < Config::MAX_BULLETS; ++bi) {
+    if (!bullets[bi].active) {
+      continue;
+    }
+    for (uint8_t ei = 0; ei < Config::MAX_ENEMIES; ++ei) {
+      if (!enemies[ei].active) {
+        continue;
+      }
+      if (bullets[bi].x == enemies[ei].x && bullets[bi].y == enemies[ei].y) {
+        bullets[bi].active = false;
+        enemies[ei].active = false;
+        score++;
+        break;
+      }
+    }
+  }
+}
+
+void drawDigit3x5(uint8_t digit, uint8_t startX, uint8_t startY) {
+  if (digit > 9) {
+    return;
+  }
+  for (uint8_t col = 0; col < 3; ++col) {
+    const uint8_t bits = DIGITS_3X5[digit][col];
+    for (uint8_t row = 0; row < 5; ++row) {
+      if ((bits >> row) & 0x01) {
+        mx.setPoint(startY + row, startX + col, true);
+      }
+    }
+  }
+}
+
+void setScorePoint(uint8_t localX, uint8_t localY, bool state) {
+  if (localX >= Config::SCORE_ZONE_WIDTH || localY >= Config::DISPLAY_HEIGHT) {
+    return;
+  }
+
+  // Apply vertical flip only in the score 8x8 module.
+  const uint8_t globalX = Config::SCORE_ZONE_X_START + localX;
+  const uint8_t globalY = Config::DISPLAY_HEIGHT - 1 - localY;
+  mx.setPoint(globalY, globalX, state);
+}
+
+void drawDigit3x5RotatedCW(uint8_t digit, uint8_t localStartX, uint8_t localStartY) {
+  if (digit > 9) {
+    return;
+  }
+  for (uint8_t col = 0; col < 3; ++col) {
+    const uint8_t bits = DIGITS_3X5[digit][col];
+    for (uint8_t row = 0; row < 5; ++row) {
+      if ((bits >> row) & 0x01) {
+        const uint8_t rotatedX = localStartX + (4 - row);
+        const uint8_t rotatedY = localStartY + col;
+        setScorePoint(rotatedX, rotatedY, true);
+      }
+    }
+  }
+}
+
+void drawScoreZone() {
+  const bool showScore =
+      !isGameOver || ((millis() / Config::SCORE_BLINK_MS) % 2 == 0);
+  if (!showScore) {
+    return;
+  }
+
+  const uint8_t shownScore = static_cast<uint8_t>(score % 100);
+  const uint8_t tens = shownScore / 10;
+  const uint8_t ones = shownScore % 10;
+
+  // Draw a subtle frame around the 8x8 score zone.
+  for (uint8_t x = 0; x < Config::SCORE_ZONE_WIDTH; ++x) {
+    setScorePoint(x, 0, true);
+    setScorePoint(x, Config::DISPLAY_HEIGHT - 1, true);
+  }
+
+  // Vertical layout: two rotated digits stacked in the 8x8 score module.
+  drawDigit3x5RotatedCW(tens, 1, 1);
+  drawDigit3x5RotatedCW(ones, 1, 4);
+}
+
+void updateGame() {
+  const uint32_t now = millis();
+  if (isGameOver) {
+    if (now - gameOverStartedAt >= Config::GAME_OVER_PREVIEW_MS) {
+      resetGame();
+    }
+    return;
+  }
+
+  if (now - lastBulletStepAt >= Config::BULLET_STEP_MS) {
+    lastBulletStepAt = now;
+    moveBullets();
+  }
+
+  if (now - lastEnemySpawnAt >= currentEnemySpawnMs()) {
+    lastEnemySpawnAt = now;
+    spawnEnemy();
+  }
+
+  if (now - lastEnemyStepAt >= currentEnemyStepMs()) {
+    lastEnemyStepAt = now;
+    moveEnemies();
+  }
+
+  resolveHits();
+
+  if (now - lastScorePrintAt >= Config::SCORE_PRINT_MS) {
+    lastScorePrintAt = now;
+    Serial.print(F("SCORE="));
+    Serial.print(score);
+    Serial.print(F(" ENEMY_STEP="));
+    Serial.print(currentEnemyStepMs());
+    Serial.print(F(" SPAWN="));
+    Serial.println(currentEnemySpawnMs());
+  }
+}
+
+void render() {
+  const uint32_t now = millis();
+  if (now - lastRenderAt < Config::RENDER_DELAY_MS) {
+    return;
+  }
+  lastRenderAt = now;
+
+  mx.clear();
+
+  // Ship shape (nose + two wings)
+  mx.setPoint(player.y, player.x, true);
+  if (player.x > 0) {
+    mx.setPoint(player.y, player.x - 1, true);
+  }
+  if (player.y > 0) {
+    mx.setPoint(player.y - 1, player.x - 1, true);
+  }
+  if (player.y < static_cast<int8_t>(Config::DISPLAY_HEIGHT - 1)) {
+    mx.setPoint(player.y + 1, player.x - 1, true);
+  }
+
+  for (uint8_t i = 0; i < Config::MAX_BULLETS; ++i) {
+    if (bullets[i].active) {
+      mx.setPoint(bullets[i].y, bullets[i].x, true);
+    }
+  }
+
+  for (uint8_t i = 0; i < Config::MAX_ENEMIES; ++i) {
+    if (enemies[i].active) {
+      mx.setPoint(enemies[i].y, enemies[i].x, true);
+      if ((i % 2) == 0 && enemies[i].y < static_cast<int8_t>(Config::DISPLAY_HEIGHT - 1)) {
+        mx.setPoint(enemies[i].y + 1, enemies[i].x, true);
+      }
+    }
+  }
+
+  if (isGameOver) {
+    for (uint8_t x = 0; x < Config::GAME_WIDTH; ++x) {
+      if ((x + (now / 120)) % 2 == 0) {
+        mx.setPoint(0, x, true);
+        mx.setPoint(Config::DISPLAY_HEIGHT - 1, x, true);
+      }
+    }
+  }
+
+  drawScoreZone();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(Config::JOY_BUTTON_PIN, INPUT_PULLUP);
+
+  mx.begin();
+  mx.control(MD_MAX72XX::INTENSITY, Config::BRIGHTNESS);
+  mx.clear();
+
+  randomSeed(analogRead(Config::JOY_X_PIN) ^ analogRead(Config::JOY_Y_PIN));
+  resetGame();
+}
+
+void loop() {
+  readControls();
+  updateGame();
+  render();
+}

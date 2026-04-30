@@ -1,0 +1,273 @@
+#include <Arduino.h>
+#include <MD_MAX72xx.h>
+#include <SPI.h>
+
+namespace Config {
+constexpr uint8_t MAX_DEVICES = 8;
+constexpr uint8_t DATA_PIN = 11;
+constexpr uint8_t CLK_PIN = 13;
+constexpr uint8_t CS_PIN = 10;
+
+constexpr uint8_t JOY_X_PIN = A0;
+constexpr uint8_t JOY_Y_PIN = A1;
+constexpr uint8_t JOY_BUTTON_PIN = 2;
+
+constexpr uint8_t DISPLAY_WIDTH = MAX_DEVICES * 8;
+constexpr uint8_t DISPLAY_HEIGHT = 8;
+
+constexpr int ANALOG_CENTER = 512;
+constexpr int ANALOG_DEADZONE = 180;
+constexpr uint8_t BRIGHTNESS = 1;
+
+constexpr uint16_t INPUT_COOLDOWN_MS = 120;
+constexpr uint16_t RENDER_DELAY_MS = 30;
+constexpr uint16_t START_MOVE_INTERVAL_MS = 220;
+constexpr uint16_t MIN_MOVE_INTERVAL_MS = 85;
+constexpr uint8_t SPEED_STEP_MS = 8;
+
+constexpr uint16_t MAX_SNAKE_LENGTH = 128;
+}  // namespace Config
+
+// Most 8x32/8x64 MAX7219 modules sold for Arduino use FC16 wiring.
+// If the image looks scrambled, try PAROLA_HW or GENERIC_HW instead.
+MD_MAX72XX mx = MD_MAX72XX(MD_MAX72XX::FC16_HW, Config::CS_PIN,
+                           Config::MAX_DEVICES);
+
+struct Point {
+  uint8_t x;
+  uint8_t y;
+};
+
+enum Direction : uint8_t {
+  DIR_UP,
+  DIR_RIGHT,
+  DIR_DOWN,
+  DIR_LEFT,
+};
+
+Point snake[Config::MAX_SNAKE_LENGTH];
+uint16_t snakeLength = 3;
+
+Point food = {10, 3};
+Direction currentDir = DIR_RIGHT;
+Direction nextDir = DIR_RIGHT;
+
+bool isGameOver = false;
+bool blinkFood = true;
+bool restartLatch = false;
+
+uint16_t moveIntervalMs = Config::START_MOVE_INTERVAL_MS;
+uint32_t lastMoveAt = 0;
+uint32_t lastRenderAt = 0;
+uint32_t lastInputAt = 0;
+
+bool pointsEqual(const Point &a, const Point &b) {
+  return a.x == b.x && a.y == b.y;
+}
+
+bool isOpposite(Direction a, Direction b) {
+  return ((a == DIR_UP && b == DIR_DOWN) || (a == DIR_DOWN && b == DIR_UP) ||
+          (a == DIR_LEFT && b == DIR_RIGHT) ||
+          (a == DIR_RIGHT && b == DIR_LEFT));
+}
+
+bool isInsideField(const Point &p) {
+  return p.x < Config::DISPLAY_WIDTH && p.y < Config::DISPLAY_HEIGHT;
+}
+
+Point nextHeadPosition(const Point &head, Direction dir) {
+  Point next = head;
+  switch (dir) {
+    case DIR_UP:
+      next.y--;
+      break;
+    case DIR_RIGHT:
+      next.x++;
+      break;
+    case DIR_DOWN:
+      next.y++;
+      break;
+    case DIR_LEFT:
+      next.x--;
+      break;
+  }
+  return next;
+}
+
+bool pointOnSnake(const Point &p, uint16_t lenToCheck) {
+  for (uint16_t i = 0; i < lenToCheck; ++i) {
+    if (pointsEqual(snake[i], p)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void placeFood() {
+  if (snakeLength >= Config::MAX_SNAKE_LENGTH) {
+    return;
+  }
+
+  Point candidate;
+  for (uint16_t tries = 0; tries < 1000; ++tries) {
+    candidate.x = static_cast<uint8_t>(random(Config::DISPLAY_WIDTH));
+    candidate.y = static_cast<uint8_t>(random(Config::DISPLAY_HEIGHT));
+    if (!pointOnSnake(candidate, snakeLength)) {
+      food = candidate;
+      return;
+    }
+  }
+}
+
+void resetGame() {
+  const uint8_t midY = Config::DISPLAY_HEIGHT / 2;
+  const uint8_t startX = Config::DISPLAY_WIDTH / 4;
+
+  snakeLength = 3;
+  snake[0] = {static_cast<uint8_t>(startX + 2), midY};
+  snake[1] = {static_cast<uint8_t>(startX + 1), midY};
+  snake[2] = {startX, midY};
+
+  currentDir = DIR_RIGHT;
+  nextDir = DIR_RIGHT;
+  isGameOver = false;
+  blinkFood = true;
+  moveIntervalMs = Config::START_MOVE_INTERVAL_MS;
+
+  placeFood();
+
+  lastMoveAt = millis();
+  lastRenderAt = 0;
+  lastInputAt = 0;
+}
+
+void readControls() {
+  const uint32_t now = millis();
+  if (now - lastInputAt < Config::INPUT_COOLDOWN_MS) {
+    return;
+  }
+
+  const int x = analogRead(Config::JOY_X_PIN);
+  const int y = analogRead(Config::JOY_Y_PIN);
+
+  Direction candidate = nextDir;
+  if (x > (Config::ANALOG_CENTER + Config::ANALOG_DEADZONE)) {
+    candidate = DIR_RIGHT;
+  } else if (x < (Config::ANALOG_CENTER - Config::ANALOG_DEADZONE)) {
+    candidate = DIR_LEFT;
+  } else if (y > (Config::ANALOG_CENTER + Config::ANALOG_DEADZONE)) {
+    candidate = DIR_UP;
+  } else if (y < (Config::ANALOG_CENTER - Config::ANALOG_DEADZONE)) {
+    candidate = DIR_DOWN;
+  }
+
+  if (!isOpposite(candidate, currentDir)) {
+    nextDir = candidate;
+  }
+
+  if (candidate != currentDir) {
+    lastInputAt = now;
+  }
+}
+
+void updateGame() {
+  if (isGameOver) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (now - lastMoveAt < moveIntervalMs) {
+    return;
+  }
+  lastMoveAt = now;
+
+  currentDir = nextDir;
+  const Point newHead = nextHeadPosition(snake[0], currentDir);
+
+  if (!isInsideField(newHead)) {
+    isGameOver = true;
+    return;
+  }
+
+  const bool eating = pointsEqual(newHead, food);
+
+  if (eating) {
+    if (snakeLength < Config::MAX_SNAKE_LENGTH) {
+      for (int i = static_cast<int>(snakeLength); i > 0; --i) {
+        snake[i] = snake[i - 1];
+      }
+      snake[0] = newHead;
+      ++snakeLength;
+      if (moveIntervalMs > Config::MIN_MOVE_INTERVAL_MS + Config::SPEED_STEP_MS) {
+        moveIntervalMs -= Config::SPEED_STEP_MS;
+      }
+      placeFood();
+    }
+  } else {
+    for (int i = static_cast<int>(snakeLength) - 1; i > 0; --i) {
+      snake[i] = snake[i - 1];
+    }
+    snake[0] = newHead;
+  }
+
+  for (uint16_t i = 1; i < snakeLength; ++i) {
+    if (pointsEqual(snake[0], snake[i])) {
+      isGameOver = true;
+      return;
+    }
+  }
+}
+
+void render() {
+  const uint32_t now = millis();
+  if (now - lastRenderAt < Config::RENDER_DELAY_MS) {
+    return;
+  }
+  lastRenderAt = now;
+
+  blinkFood = !blinkFood;
+  mx.clear();
+
+  for (uint16_t i = 1; i < snakeLength; ++i) {
+    mx.setPoint(snake[i].y, snake[i].x, true);
+  }
+  mx.setPoint(snake[0].y, snake[0].x, true);
+
+  if (blinkFood && !isGameOver) {
+    mx.setPoint(food.y, food.x, true);
+  }
+
+  if (isGameOver) {
+    for (uint8_t x = 0; x < Config::DISPLAY_WIDTH; x += 2) {
+      mx.setPoint(0, x, true);
+      mx.setPoint(Config::DISPLAY_HEIGHT - 1, x, true);
+    }
+  }
+}
+
+void handleRestartButton() {
+  const bool pressed = digitalRead(Config::JOY_BUTTON_PIN) == LOW;
+  if (pressed && !restartLatch && isGameOver) {
+    resetGame();
+  }
+  restartLatch = pressed;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(Config::JOY_BUTTON_PIN, INPUT_PULLUP);
+
+  mx.begin();
+  mx.control(MD_MAX72XX::INTENSITY, Config::BRIGHTNESS);
+  mx.clear();
+
+  randomSeed(analogRead(Config::JOY_X_PIN) ^ analogRead(Config::JOY_Y_PIN));
+  resetGame();
+}
+
+void loop() {
+  readControls();
+  updateGame();
+  handleRestartButton();
+  render();
+}

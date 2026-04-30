@@ -1,0 +1,393 @@
+#include <Arduino.h>
+#include <MD_MAX72xx.h>
+#include <SPI.h>
+
+namespace Config {
+constexpr uint8_t MAX_DEVICES = 8;
+constexpr uint8_t CS_PIN = 10;
+
+constexpr uint8_t JOY_X_PIN = A0;
+constexpr uint8_t JOY_Y_PIN = A1;
+
+constexpr uint8_t DISPLAY_WIDTH = MAX_DEVICES * 8;
+constexpr uint8_t DISPLAY_HEIGHT = 8;
+
+// Fixed 40x8 playfield anchored to the left side of the 64x8 matrix.
+constexpr uint8_t ARENA_X0 = 0;
+constexpr uint8_t ARENA_WIDTH = 40;
+constexpr uint8_t ARENA_X1 = ARENA_X0 + ARENA_WIDTH - 1;
+constexpr uint8_t NET_X = ARENA_X0 + (ARENA_WIDTH / 2);
+constexpr uint8_t BOT_MIN_X = NET_X + 4;
+
+constexpr int ANALOG_CENTER = 512;
+constexpr int ANALOG_DEADZONE = 130;
+
+constexpr uint8_t BRIGHTNESS = 1;
+constexpr uint8_t PADDLE_SIZE = 3;
+constexpr uint8_t WIN_SCORE = 9;
+
+constexpr uint16_t INPUT_COOLDOWN_MS = 70;
+constexpr uint16_t BOT_STEP_MS = 85;
+constexpr uint16_t BOT_STEP_SLOW_MS = 115;
+constexpr uint16_t BALL_STEP_START_MS = 118;
+constexpr uint16_t BALL_STEP_MIN_MS = 70;
+constexpr uint8_t BALL_SPEEDUP_EVERY = 5;
+constexpr uint16_t RENDER_DELAY_MS = 28;
+constexpr uint16_t GAME_OVER_PREVIEW_MS = 3000;
+constexpr uint16_t BLINK_MS = 180;
+}  // namespace Config
+
+MD_MAX72XX mx =
+    MD_MAX72XX(MD_MAX72XX::FC16_HW, Config::CS_PIN, Config::MAX_DEVICES);
+
+struct Paddle {
+  int8_t x;
+  int8_t y;
+};
+
+Paddle player = {4, 2};
+Paddle bot = {Config::ARENA_X1 - 4, 2};
+
+int8_t ballX = Config::NET_X;
+int8_t ballY = Config::DISPLAY_HEIGHT / 2;
+int8_t ballVelX = -1;
+int8_t ballVelY = 1;
+
+uint8_t playerScore = 0;
+uint8_t botScore = 0;
+uint16_t rallies = 0;
+
+bool isGameOver = false;
+uint32_t gameOverStartedAt = 0;
+
+uint32_t lastInputAt = 0;
+uint32_t lastBotStepAt = 0;
+uint32_t lastBotAimAt = 0;
+uint32_t lastBallStepAt = 0;
+uint32_t lastRenderAt = 0;
+
+int8_t botAimErrorY = 0;
+
+bool inPaddleRange(int8_t y, const Paddle &p) {
+  return y >= p.y && y < (p.y + Config::PADDLE_SIZE);
+}
+
+void clampPaddle(Paddle &p, bool isPlayer) {
+  if (p.y < 0) {
+    p.y = 0;
+  }
+  if (p.y > (Config::DISPLAY_HEIGHT - Config::PADDLE_SIZE)) {
+    p.y = Config::DISPLAY_HEIGHT - Config::PADDLE_SIZE;
+  }
+
+  const int8_t minX = isPlayer ? Config::ARENA_X0 : Config::BOT_MIN_X;
+  const int8_t maxX = isPlayer ? (Config::NET_X - 1) : Config::ARENA_X1;
+  if (p.x < minX) {
+    p.x = minX;
+  }
+  if (p.x > maxX) {
+    p.x = maxX;
+  }
+}
+
+void resetRound() {
+  player = {4, 2};
+  bot = {Config::ARENA_X1 - 4, 2};
+
+  ballX = Config::NET_X;
+  ballY = Config::DISPLAY_HEIGHT / 2;
+  ballVelX = random(2) == 0 ? -1 : 1;
+  ballVelY = random(2) == 0 ? -1 : 1;
+
+  botAimErrorY = static_cast<int8_t>(random(-1, 2));
+  lastBotAimAt = millis();
+
+  lastBallStepAt = millis();
+}
+
+void resetMatch() {
+  playerScore = 0;
+  botScore = 0;
+  rallies = 0;
+
+  isGameOver = false;
+  gameOverStartedAt = 0;
+
+  const uint32_t now = millis();
+  lastInputAt = now;
+  lastBotStepAt = now;
+  lastBotAimAt = now;
+  lastRenderAt = 0;
+
+  resetRound();
+}
+
+void triggerGameOver() {
+  if (isGameOver) {
+    return;
+  }
+  isGameOver = true;
+  gameOverStartedAt = millis();
+}
+
+uint16_t currentBallStepMs() {
+  const uint16_t speedStages = rallies / Config::BALL_SPEEDUP_EVERY;
+  uint16_t interval = Config::BALL_STEP_START_MS - (speedStages * 6);
+
+  // Smooth wave: speed goes up/down so rallies feel less mechanical.
+  const uint8_t phase = static_cast<uint8_t>((millis() / 220) % 10);  // 0..9
+  const uint8_t wave = (phase < 5) ? phase : (9 - phase);             // 0..4..0
+  interval += static_cast<uint16_t>(wave * 5);
+
+  // When ball goes to the bot, make it slightly faster to force misses.
+  if (ballVelX > 0 && interval > 10) {
+    interval -= 10;
+  }
+
+  if (interval < Config::BALL_STEP_MIN_MS) {
+    interval = Config::BALL_STEP_MIN_MS;
+  }
+  return interval;
+}
+
+void readPlayerInput() {
+  if (isGameOver) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (now - lastInputAt < Config::INPUT_COOLDOWN_MS) {
+    return;
+  }
+
+  const int rawX = analogRead(Config::JOY_X_PIN);
+  const int rawY = analogRead(Config::JOY_Y_PIN);
+
+  bool moved = false;
+
+  if (rawX > (Config::ANALOG_CENTER + Config::ANALOG_DEADZONE)) {
+    player.x++;
+    moved = true;
+  } else if (rawX < (Config::ANALOG_CENTER - Config::ANALOG_DEADZONE)) {
+    player.x--;
+    moved = true;
+  }
+
+  if (rawY > (Config::ANALOG_CENTER + Config::ANALOG_DEADZONE)) {
+    player.y--;
+    moved = true;
+  } else if (rawY < (Config::ANALOG_CENTER - Config::ANALOG_DEADZONE)) {
+    player.y++;
+    moved = true;
+  }
+
+  clampPaddle(player, true);
+  if (moved) {
+    lastInputAt = now;
+  }
+}
+
+void updateBot() {
+  if (isGameOver) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  const uint16_t botStepMs = (ballVelX > 0) ? Config::BOT_STEP_SLOW_MS : Config::BOT_STEP_MS;
+  if (now - lastBotStepAt < botStepMs) {
+    return;
+  }
+  lastBotStepAt = now;
+
+  // Periodically introduce small aim error so the bot can fail.
+  if (now - lastBotAimAt >= 260) {
+    lastBotAimAt = now;
+    botAimErrorY = static_cast<int8_t>(random(-2, 3));
+  }
+
+  // Sometimes skip one movement tick while defending.
+  if (ballVelX > 0 && random(100) < 24) {
+    return;
+  }
+
+  // Bot avoids sticking to the net: keeps a front offset plus slight patrol.
+  int8_t targetX = ballX + 6;
+  if ((millis() / 320) % 2 == 0) {
+    targetX += 1;
+  }
+
+  if (targetX < Config::BOT_MIN_X) {
+    targetX = Config::BOT_MIN_X;
+  }
+  if (targetX > Config::ARENA_X1) {
+    targetX = Config::ARENA_X1;
+  }
+
+  if (targetX < bot.x) {
+    bot.x--;
+  } else if (targetX > bot.x) {
+    bot.x++;
+  }
+
+  const int8_t botCenterY = bot.y + (Config::PADDLE_SIZE / 2);
+  const int8_t targetY = ballY + botAimErrorY;
+  if (targetY < botCenterY) {
+    bot.y--;
+  } else if (targetY > botCenterY) {
+    bot.y++;
+  }
+
+  clampPaddle(bot, false);
+}
+
+void onPointScored(bool playerPoint) {
+  if (playerPoint) {
+    playerScore++;
+  } else {
+    botScore++;
+  }
+
+  rallies = 0;
+  if (playerScore >= Config::WIN_SCORE || botScore >= Config::WIN_SCORE) {
+    triggerGameOver();
+    return;
+  }
+
+  resetRound();
+}
+
+void updateBall() {
+  if (isGameOver) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (now - lastBallStepAt < currentBallStepMs()) {
+    return;
+  }
+  lastBallStepAt = now;
+
+  int8_t nextX = ballX + ballVelX;
+  int8_t nextY = ballY + ballVelY;
+
+  if (nextY < 0 || nextY >= Config::DISPLAY_HEIGHT) {
+    ballVelY = -ballVelY;
+    nextY = ballY + ballVelY;
+  }
+
+  if (ballVelX < 0 && nextX == player.x && inPaddleRange(nextY, player)) {
+    ballVelX = 1;
+    const int8_t hit = nextY - (player.y + 1);
+    if (hit < 0) {
+      ballVelY = -1;
+    } else if (hit > 0) {
+      ballVelY = 1;
+    }
+    rallies++;
+    nextX = ballX + ballVelX;
+  }
+
+  if (ballVelX > 0 && nextX == bot.x && inPaddleRange(nextY, bot)) {
+    ballVelX = -1;
+    const int8_t hit = nextY - (bot.y + 1);
+    if (hit < 0) {
+      ballVelY = -1;
+    } else if (hit > 0) {
+      ballVelY = 1;
+    }
+    rallies++;
+    nextX = ballX + ballVelX;
+  }
+
+  ballX = nextX;
+  ballY = nextY;
+
+  if (ballX < Config::ARENA_X0) {
+    onPointScored(false);
+  } else if (ballX > Config::ARENA_X1) {
+    onPointScored(true);
+  }
+}
+
+void updateGame() {
+  if (isGameOver) {
+    if (millis() - gameOverStartedAt >= Config::GAME_OVER_PREVIEW_MS) {
+      resetMatch();
+    }
+    return;
+  }
+
+  readPlayerInput();
+  updateBot();
+  updateBall();
+}
+
+void drawPaddle(const Paddle &p) {
+  for (uint8_t i = 0; i < Config::PADDLE_SIZE; ++i) {
+    const int8_t y = p.y + i;
+    if (y >= 0 && y < Config::DISPLAY_HEIGHT) {
+      mx.setPoint(static_cast<uint8_t>(y), static_cast<uint8_t>(p.x), true);
+    }
+  }
+}
+
+void drawScoreSimple() {
+  // Compact score bar in the unused right side (x 40..63).
+  for (uint8_t i = 0; i < playerScore && i < 8; ++i) {
+    mx.setPoint(i, 42, true);
+  }
+  for (uint8_t i = 0; i < botScore && i < 8; ++i) {
+    mx.setPoint(i, 45, true);
+  }
+}
+
+void render() {
+  const uint32_t now = millis();
+  if (now - lastRenderAt < Config::RENDER_DELAY_MS) {
+    return;
+  }
+  lastRenderAt = now;
+
+  mx.clear();
+
+  // Fixed net in the middle of the 40x8 arena.
+  for (uint8_t y = 0; y < Config::DISPLAY_HEIGHT; y += 2) {
+    mx.setPoint(y, Config::NET_X, true);
+  }
+
+  drawPaddle(player);
+  drawPaddle(bot);
+
+  const bool showBall = !isGameOver || ((now / Config::BLINK_MS) % 2 == 0);
+  if (showBall && ballX >= Config::ARENA_X0 && ballX <= Config::ARENA_X1 &&
+      ballY >= 0 && ballY < Config::DISPLAY_HEIGHT) {
+    mx.setPoint(static_cast<uint8_t>(ballY), static_cast<uint8_t>(ballX), true);
+  }
+
+  if (isGameOver) {
+    for (uint8_t x = Config::ARENA_X0; x <= Config::ARENA_X1; ++x) {
+      if (((x + (now / 120)) % 2) == 0) {
+        mx.setPoint(0, x, true);
+        mx.setPoint(Config::DISPLAY_HEIGHT - 1, x, true);
+      }
+    }
+  }
+
+  drawScoreSimple();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  mx.begin();
+  mx.control(MD_MAX72XX::INTENSITY, Config::BRIGHTNESS);
+  mx.clear();
+
+  randomSeed(analogRead(Config::JOY_X_PIN) ^ analogRead(Config::JOY_Y_PIN));
+  resetMatch();
+}
+
+void loop() {
+  updateGame();
+  render();
+}
