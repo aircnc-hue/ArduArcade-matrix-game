@@ -65,6 +65,15 @@ pio run
 pio run -t upload --upload-port /dev/ttyACM0
 ```
 
+## Usar con Arduino IDE
+
+Si vas a cargar uno de estos sketches con el IDE de Arduino en lugar de PlatformIO:
+
+- renombra el archivo principal de `main.cpp` a `nombre_del_sketch.ino`
+- elimina la linea `#include <Arduino.h>` del encabezado
+
+El IDE de Arduino genera ese include de forma implicita y espera trabajar con un archivo `.ino`, no con `.cpp`.
+
 ## Cambiar de juego
 
 El sketch activo es siempre [src/main.cpp](/home/javier/Tetris_LCD/src/main.cpp).
