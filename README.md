@@ -1,64 +1,80 @@
 # ArduArcade Matrix Game
 
-Un mismo circuito muy simple para varios juegos arcade retro sobre Arduino Uno y matrices LED MAX7219. El enfoque del proyecto es educativo y maker: aprender, reutilizar hardware sencillo y construir una base arcade retro facil de montar y modificar.
+Varios juegos arcade retro en una sola base de hardware: Arduino Uno, joystick analogico y matriz MAX7219. El proyecto esta pensado para educacion, talleres y makers que quieran aprender logica de juego, entradas analogicas y electronica sencilla sin cambiar de circuito cada vez.
 
-## Idea
+## Que es
 
-Este proyecto usa una unica base de hardware:
+La idea es simple: un mismo montaje fisico, varios juegos cargables.
 
-- Arduino Uno
+- una base comun con Arduino Uno
 - joystick analogico con pulsador
 - matriz LED MAX7219 encadenada
+- sketches intercambiables para probar juegos distintos
 
-Con ese mismo montaje se pueden cargar distintos juegos arcade guardados como variantes del sketch principal.
+Esto permite usar el proyecto como banco de pruebas, actividad educativa o mini arcade retro de sobremesa.
+
+## Para quien es
+
+- educacion tecnica y aprendizaje practico
+- makers que quieran reutilizar el mismo circuito
+- talleres de electronica creativa
+- personas que quieran empezar con juegos simples en microcontroladores
 
 ## Juegos incluidos
 
-- Pong para 4 displays de 8x8 en [src/main.cpp](/home/javier/Tetris_LCD/src/main.cpp)
-- Dodger en [src/main.cpp.dodger](/home/javier/Tetris_LCD/src/main.cpp.dodger)
-- Shooter de nave en [src/main.cpp.shooter](/home/javier/Tetris_LCD/src/main.cpp.shooter)
-- Snake en [src/main.cpp.snake](/home/javier/Tetris_LCD/src/main.cpp.snake)
-- Sketch de pruebas en [src/main.cpp.test](/home/javier/Tetris_LCD/src/main.cpp.test)
+| Juego | Archivo | Descripcion |
+| --- | --- | --- |
+| Pong | [src/main.cpp](/home/javier/Tetris_LCD/src/main.cpp) | Version activa. Pensada para 4 displays de 8x8, con marcador y sets. |
+| Dodger | [src/main.cpp.dodger](/home/javier/Tetris_LCD/src/main.cpp.dodger) | Esquiva obstaculos, con dash, vidas y aumento de dificultad. |
+| Shooter | [src/main.cpp.shooter](/home/javier/Tetris_LCD/src/main.cpp.shooter) | Nave lateral con disparos, enemigos y marcador dedicado. |
+| Snake | [src/main.cpp.snake](/home/javier/Tetris_LCD/src/main.cpp.snake) | Variante de Snake para matriz LED. |
+| Test | [src/main.cpp.test](/home/javier/Tetris_LCD/src/main.cpp.test) | Verificacion de joystick, orientacion y matriz antes de jugar. |
 
-## Hardware
+## Hardware base
 
 - Arduino Uno
-- 4 u 8 modulos MAX7219 de 8x8 segun el juego cargado
-- joystick analogico
+- 4 u 8 modulos MAX7219 de 8x8, segun el juego cargado
+- joystick analogico con pulsador
 - cables Dupont
-- fuente de 5V adecuada para la matriz LED
+- fuente de 5V estable para la matriz LED
 
-## Cableado base
+## Conexion rapida
 
-MAX7219:
+### Matriz MAX7219
 
-- `VCC` -> `5V`
-- `GND` -> `GND`
-- `DIN` -> `D11`
-- `CS` / `LOAD` -> `D10`
-- `CLK` -> `D13`
+| Modulo | Arduino Uno |
+| --- | --- |
+| VCC | 5V |
+| GND | GND |
+| DIN | D11 |
+| CS / LOAD | D10 |
+| CLK | D13 |
 
-Joystick:
+### Joystick
 
-- `VCC` -> `5V`
-- `GND` -> `GND`
-- `VRX` -> `A0`
-- `VRY` -> `A1`
-- `SW` -> `D2` cuando el juego usa boton
+| Joystick | Arduino Uno |
+| --- | --- |
+| VCC | 5V |
+| GND | GND |
+| VRX | A0 |
+| VRY | A1 |
+| SW | D2 |
 
-Notas de montaje:
+## Notas de montaje
 
 - Usa siempre masa comun entre Arduino, joystick y matriz.
-- Si la matriz se comporta raro, revisa que estes entrando por el lado `IN` del primer modulo.
-- Para varios modulos, alimenta la matriz con una fuente de 5V estable.
+- Conecta el primer modulo MAX7219 por el lado `IN`.
+- Si usas varios modulos, alimenta la matriz con una fuente de 5V estable.
+- Si la imagen sale rara, revisa orientacion, orden fisico de los modulos y tipo de hardware.
 
-## Configuracion actual
+## Configuracion del proyecto
 
-- Entorno PlatformIO para `Arduino Uno`
-- Libreria `MD_MAX72XX`
-- Tipo de hardware de matriz: `FC16_HW`
+- placa objetivo: `Arduino Uno`
+- entorno: `PlatformIO`
+- libreria principal: `MD_MAX72XX`
+- tipo de hardware configurado: `FC16_HW`
 
-## Compilar y subir
+## Compilar y subir con PlatformIO
 
 ```bash
 pio run
@@ -67,50 +83,47 @@ pio run -t upload --upload-port /dev/ttyACM0
 
 ## Usar con Arduino IDE
 
-Si vas a cargar uno de estos sketches con el IDE de Arduino en lugar de PlatformIO:
+Si prefieres cargar los sketches con Arduino IDE en lugar de PlatformIO:
 
-- renombra el archivo principal de `main.cpp` a `nombre_del_sketch.ino`
-- elimina la linea `#include <Arduino.h>` del encabezado
+1. Renombra el archivo principal de `main.cpp` a `nombre_del_sketch.ino`.
+2. Elimina la linea `#include <Arduino.h>` del encabezado.
 
-El IDE de Arduino genera ese include de forma implicita y espera trabajar con un archivo `.ino`, no con `.cpp`.
+Arduino IDE agrega ese include de forma implicita y trabaja sobre archivos `.ino`, no sobre `.cpp`.
 
 ## Cambiar de juego
 
 El sketch activo es siempre [src/main.cpp](/home/javier/Tetris_LCD/src/main.cpp).
 
-Para cargar otro juego:
+Para activar otro juego desde terminal:
 
 ```bash
 cp src/main.cpp.shooter src/main.cpp
 pio run -t upload --upload-port /dev/ttyACM0
 ```
 
-Sustituye `main.cpp.shooter` por `main.cpp.dodger`, `main.cpp.pong40`, `main.cpp.snake` o el archivo que quieras activar.
+Puedes sustituir `main.cpp.shooter` por `main.cpp.dodger`, `main.cpp.pong40`, `main.cpp.snake` o `main.cpp.test`.
+
+## Flujo recomendado
+
+1. Empieza con [src/main.cpp.test](/home/javier/Tetris_LCD/src/main.cpp.test) para comprobar joystick y orientacion.
+2. Cuando el hardware responda bien, carga el juego que quieras.
+3. Ajusta cantidad de modulos y constantes del sketch si cambias de matriz.
 
 ## Circuito
 
-Aqui ira el esquema del circuito y el pinout final con imagenes.
+Aqui ira el esquema electrico final y el pinout visual del montaje.
 
 ## Video
 
-Aqui ira el video del proyecto cuando este publicado.
+Aqui ira el video del proyecto en funcionamiento.
 
 ## Galeria
 
-Aqui iran fotos del montaje, la matriz y los juegos en funcionamiento.
+Aqui iran imagenes del circuito, la matriz y los distintos juegos cargados.
 
-## Enfoque del proyecto
+## Objetivo
 
-Este repositorio esta pensado para:
-
-- educacion tecnica y aprendizaje practico
-- makers que quieran reutilizar un mismo circuito para varios juegos
-- talleres, aulas y proyectos personales de electronica creativa
-- experimentar con logica de juego, entradas analogicas y matrices LED
-
-## Objetivo del proyecto
-
-- Reutilizar un solo circuito para varios juegos
-- Aprender logica de videojuegos sencillos en microcontroladores
-- Crear una base educativa y maker facil de replicar
-- Mantener una estetica arcade retro con hardware muy accesible
+- reutilizar un solo circuito para varios juegos arcade retro
+- aprender programacion y electronica de forma visual y practica
+- ofrecer una base sencilla para educacion y makers
+- mantener una estetica retro con hardware economico y accesible
