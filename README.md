@@ -74,21 +74,34 @@ Esto permite usar el proyecto como banco de pruebas, actividad educativa o mini 
 - libreria principal: `MD_MAX72XX`
 - tipo de hardware configurado: `FC16_HW`
 
-## Compilar y subir con PlatformIO
+## Compilar y subir
+
+### Con PlatformIO (Linux / Mac / Windows)
 
 ```bash
 pio run
 pio run -t upload --upload-port /dev/ttyACM0
 ```
 
-## Usar con Arduino IDE
+En Windows, sustituye `/dev/ttyACM0` por el puerto COM que aparezca en el Administrador de dispositivos al conectar el Arduino (por ejemplo `COM3`).
 
-Si prefieres cargar los sketches con Arduino IDE en lugar de PlatformIO:
+### Con Arduino IDE (Windows, Mac o Linux)
 
-1. Renombra el archivo principal de `main.cpp` a `nombre_del_sketch.ino`.
-2. Elimina la linea `#include <Arduino.h>` del encabezado.
+Arduino IDE es la opcion mas sencilla si no tienes PlatformIO instalado.
 
-Arduino IDE agrega ese include de forma implicita y trabaja sobre archivos `.ino`, no sobre `.cpp`.
+1. Abre el sketch que quieras cargar desde la carpeta `src/`. Por ejemplo `main.cpp` para el Pong activo.
+2. Copia todo el contenido y pegalo en un sketch nuevo del IDE, o abre el archivo directamente.
+3. Elimina la primera linea del archivo:
+   ```cpp
+   #include <Arduino.h>
+   ```
+   Arduino IDE la agrega por su cuenta; si la dejas duplicada dara error de compilacion.
+4. Instala la libreria `MD_MAX72XX` desde el gestor de librerias del IDE: `Herramientas > Administrar bibliotecas > busca MD_MAX72XX > instala la de MajicDesigns`.
+5. Selecciona la placa: `Herramientas > Placa > Arduino Uno`.
+6. Selecciona el puerto: `Herramientas > Puerto > el COM que aparezca al conectar el Arduino`.
+7. Pulsa `Subir` (flecha hacia la derecha). El IDE compilara y grabara el sketch en la placa.
+
+El resto del codigo queda exactamente igual; solo es necesario quitar esa primera linea.
 
 ## Cambiar de juego
 
