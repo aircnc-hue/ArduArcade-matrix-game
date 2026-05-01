@@ -124,7 +124,7 @@ Puedes sustituir `main.cpp.shooter` por `main.cpp.dodger`, `main.cpp.pong40`, `m
 
 ## Circuito
 
-Aqui ira el esquema electrico final y el pinout visual del montaje.
+![Circuito](assets/arduino_matrix_game.jpg)
 
 ## Video
 
