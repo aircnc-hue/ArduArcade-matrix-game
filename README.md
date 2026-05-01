@@ -132,7 +132,7 @@ Aqui ira el video del proyecto en funcionamiento.
 
 ## Galeria
 
-Aqui iran imagenes del circuito, la matriz y los distintos juegos cargados.
+![Galeria](assets/ardu_pong.png)
 
 ## Objetivo
 
